@@ -1,0 +1,646 @@
+/*
+ * Project: udptunnel
+ * File: udpclient.c
+ *
+ * Copyright (C) 2009 Daniel Meekins
+	 * Contact: dmeekins - gmail
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+	 *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
+#define OPENSSLKEY "inter.key"
+#define PUBLICKEY "inter_pub.key"
+#ifndef WIN32
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <sys/types.h>
+#else
+#include "helpers/winhelpers.h"
+#endif
+
+#include "common.h"
+#include "message.h"
+#include "socket.h"
+#include "client.h"
+#include "list.h"
+#include "socks5.h"
+#include "crypt.h"
+
+extern int debug_level;
+extern int ipver;
+static int running = 1;
+static uint16_t next_req_id;
+static char *lhost, *lport, *phost, *pport, *rhost,*rport;
+static socket_t *tcp_serv = NULL;
+static socket_t *udp_serv = NULL;
+
+static uint16_t relays=0;
+static uint32_t localid;
+static list_t *relay_clients;
+
+/* internal functions */
+static int handle_message(uint16_t id, uint8_t msg_type,
+                          char *data, int data_len,uint32_t sourceid,list_t *clients,list_t *conn_clients);
+static void disconnect_and_remove_client(uint16_t id, list_t *clients,
+                                         fd_set *fds, int full_disconnect);
+static void signal_handler(int sig);
+
+
+int udpclient(int argc, char *argv[])
+{
+
+	list_t *clients = NULL;
+	list_t *conn_clients;
+	client_t *client;
+	client_t *tunnel;
+	client_t *client2;
+
+	char data[MSG_MAX_LEN];
+	char addrstr[ADDRSTRLEN];
+	char taddrstr[ADDRSTRLEN];
+
+	socket_t *tcp_sock = NULL;
+	socket_t *udp_sock = NULL;
+	socket_t *next_sock = NULL;
+
+	struct timeval curr_time;
+	struct timeval check_time;
+	struct timeval check_interval;
+	struct timeval timeout;
+	fd_set client_fds;
+	fd_set read_fds;
+	uint16_t tmp_id;
+	uint8_t tmp_type;
+	uint16_t tmp_len;
+	// uint16_t tmp_req_id;
+	int num_fds;
+	uint32_t sourceid;
+
+
+
+	int ret;
+	int i;
+
+	signal(SIGINT, &signal_handler);
+
+	i = 0;    
+	lhost = (argc - i == 5) ? NULL : argv[i++];
+	lport = argv[i++];
+	rport = argv[i++];
+	phost = argv[i++];
+	pport = argv[i++];
+	relays = atoi(argv[i++]);
+	if(debug_level >= DEBUG_LEVEL1)
+		printf("relays need %d \n",relays);
+
+
+	/* Check validity of ports (can't check ip's b/c might be host names) */
+
+	ERROR_GOTO(!isnum(lport), "Invalid listen port.", done);
+
+	ERROR_GOTO(!isnum(rport), "Invalid recv port.", done);
+
+	ERROR_GOTO(!isnum(pport), "Invalid inter port.", done);
+	//ERROR_GOTO(!isnum(rport), "Invalid remote port.", done);
+
+	srand(inet_addr(lhost));
+	localid=(rand());
+	generate_rsakey(lhost);
+	if(debug_level >= DEBUG_LEVEL1)
+	{
+		printf("local id %d \n",localid);
+	}
+	next_req_id = rand() % 0xffff;
+
+	/* Create an empty list for the clients */
+	clients = list_create(sizeof(client_t), p_client_cmp, p_client_copy,
+	                      p_client_free, 1);
+	ERROR_GOTO(clients == NULL, "Error creating clients list.", done);
+
+	/* Create and empty list for the connecting clients */
+	conn_clients = list_create(sizeof(client_t), p_client_cmp, p_client_copy,
+	                           p_client_free, 1);
+	ERROR_GOTO(conn_clients == NULL, "Error creating conn_clients list.", done);
+
+	relay_clients = list_create(sizeof(client_t), p_client_cmp, p_client_copy,
+	                            p_client_free, 1);
+	ERROR_GOTO(relay_clients == NULL, "Error creating clients list.", done);
+
+	/* Create a TCP server socket to listen for incoming connections */
+	tcp_serv = sock_create(lhost, lport, ipver, SOCK_TYPE_TCP, 1, 1);
+
+	ERROR_GOTO(tcp_serv == NULL, "Error creating TCP socket.", done);
+	udp_serv = sock_create(lhost, rport,ipver, SOCK_TYPE_UDP, 1, 1);
+	ERROR_GOTO(udp_serv == NULL, "Error creating TCP socket.", done);
+	if(debug_level >= DEBUG_LEVEL1)
+	{
+		printf("Listening on TCP %s,UDP %s \n",
+		       sock_get_str(tcp_serv, addrstr, sizeof(addrstr)),sock_get_str(udp_serv, taddrstr, sizeof(taddrstr)));
+	}
+	next_sock = sock_create(phost, pport, ipver, SOCK_TYPE_UDP, 0, 1);
+
+	msg_send_req(next_sock,lhost,rport,0,localid);	   
+	sock_free(next_sock);		
+	next_sock = NULL;		
+
+	FD_ZERO(&client_fds);
+
+	/* Initialize all the timers */
+	timerclear(&timeout);
+	check_interval.tv_sec = 0;
+	check_interval.tv_usec = 500000;
+	gettimeofday(&check_time, NULL);
+
+
+	while(running)
+	{
+		if(!timerisset(&timeout))
+			timeout.tv_usec = 50000;
+
+		read_fds = client_fds;
+		FD_SET(SOCK_FD(tcp_serv), &read_fds);
+		FD_SET(SOCK_FD(udp_serv), &read_fds);
+
+		ret = select(FD_SETSIZE, &read_fds, NULL, NULL, &timeout);
+		PERROR_GOTO(ret < 0, "select", done);
+		num_fds = ret;
+
+		gettimeofday(&curr_time, NULL);
+
+		/* Go through all the clients and check if didn't get an ACK for sent
+		 data during the timeout period */
+		if(timercmp(&curr_time, &check_time, >))
+		{
+			for(i = 0; i < LIST_LEN(clients); i++)
+			{
+				client = list_get_at(clients, i);
+
+				ret = client_check_and_resend(client, curr_time);
+				if(ret == -2)
+				{
+					disconnect_and_remove_client(CLIENT_ID(client), clients,
+					                             &client_fds, 1);
+					i--;
+					continue;
+				}
+
+				ret = client_check_and_send_keepalive(client, curr_time);
+				if(ret == -2)
+				{
+					disconnect_and_remove_client(CLIENT_ID(client), clients,
+					                             &client_fds, 1);
+					i--;
+				}
+			}
+
+			timeradd(&curr_time, &check_interval, &check_time);
+		}
+
+		if(num_fds == 0)
+			continue;
+
+		/* Check if pending TCP connection to accept and create a new client
+		 and UDP connection if one is ready */
+		if(FD_ISSET(SOCK_FD(tcp_serv), &read_fds))
+		{
+			tcp_sock = sock_accept(tcp_serv);
+			if(tcp_sock == NULL)
+				continue;
+			if(SelectMethod(tcp_sock->fd)==-1)
+			{ 
+				if(debug_level >= DEBUG_LEVEL1)
+					printf("socks version error\n");
+				return-1;
+			}
+			rhost=ParseCommand(tcp_sock->fd);
+			if (0<LIST_LEN(relay_clients))
+			{
+
+				tunnel = list_get_at(relay_clients, 0);
+
+				udp_sock =sock_copy(CLIENT_TCP_SOCK(tunnel));
+
+				SOCK_FD(udp_sock)=socket(AF_INET, SOCK_DGRAM, 0); 					
+			}
+
+			if(udp_sock == NULL)
+			{
+				sock_close(tcp_sock);
+				sock_free(tcp_sock);
+				continue;
+			}
+
+			client = client_create(next_req_id++, localid, tcp_sock, udp_sock, 1);
+			memcpy(client->rsakey,tunnel->rsakey,strlen(tunnel->rsakey));
+
+			printf("expid rsakey is %s",client->rsakey);
+			if(debug_level >= DEBUG_LEVEL1)
+				printf("create client id %d \n",CLIENT_ID(client));
+			if(!client || !tcp_sock || !udp_sock)
+			{
+				if(tcp_sock)
+					sock_close(tcp_sock);
+				if(udp_sock)
+					sock_close(udp_sock);
+			}
+			else
+			{
+				client2 = list_add(conn_clients, client, 1);
+				client_free(client);
+				client = NULL;
+				if(debug_level >= DEBUG_LEVEL1)
+				{
+					sock_get_str(CLIENT_TCP_SOCK(client2), addrstr,
+					             sizeof(addrstr));				
+					printf("tunnel(%d): local %s ",client2->sourceid, addrstr);
+					sock_get_str(CLIENT_UDP_SOCK(client2), addrstr,
+					             sizeof(addrstr));
+					printf("to %s \n",addrstr);
+				}
+				client_send_hello(client2,rhost,CLIENT_ID(client2));
+				client_add_tcp_fd_to_set(client2, &client_fds);
+				//client_add_udp_fd_to_set(client2, &client_fds);
+			}
+
+			sock_free(tcp_sock);
+			sock_free(udp_sock);
+			tcp_sock = NULL;
+			udp_sock = NULL;
+
+			num_fds--;
+		}
+
+		/* Check for UDP data */
+		if(FD_ISSET(SOCK_FD(udp_serv), &read_fds))
+		{
+
+
+			//ret = client_recv_udp_msg(client, data, sizeof(data),
+			//                          &tmp_id, &tmp_type, &tmp_len,&sourceid);
+			ret = msg_recv_msg(udp_serv, data, sizeof(data),
+			                   &tmp_id, &tmp_type, &tmp_len,&sourceid);
+
+			if(debug_level >= DEBUG_LEVEL2)
+				printf("recv msg from %d type %d %d bytes \n ",sourceid,tmp_type,tmp_len);
+			if(ret == 0)
+				ret = handle_message(tmp_id, tmp_type,
+				                     data, tmp_len,sourceid,clients, conn_clients);
+			/*if(ret < 0)
+			{
+
+				disconnect_and_remove_client(tmp_id, clients,
+				                             &client_fds, 1);
+
+		}	*/		
+		}
+
+		/* Check if data is ready from any of the clients */
+		for(i = 0; i < LIST_LEN(clients); i++)
+		{
+			client = list_get_at(clients, i);
+
+
+
+			/* Check for TCP data */
+			if(num_fds > 0 && client_tcp_fd_isset(client, &read_fds))
+			{
+				ret = client_recv_tcp_data(client);
+				if(ret == -1)
+				{
+					disconnect_and_remove_client(CLIENT_ID(client), clients,
+					                             &client_fds, 1);
+					i--;
+					continue;
+				}
+				else if(ret == -2)
+				{
+					client_mark_to_disconnect(client);
+					disconnect_and_remove_client(CLIENT_ID(client),
+					                             clients, &client_fds, 0);
+				}
+
+				num_fds--;
+			}
+
+			/* send any TCP data that was ready */
+			ret = client_send_udp_data(client);
+			if(ret < 0)
+			{
+				disconnect_and_remove_client(CLIENT_ID(client), clients,
+				                             &client_fds, 1);
+				i--;
+			}
+		}
+
+		/* Finally, send any udp data that's still in the queue */
+		for(i = 0; i < LIST_LEN(clients); i++)
+		{
+			client = list_get_at(clients, i);
+			ret = client_send_udp_data(client);
+
+			if(ret < 0 || client_ready_to_disconnect(client))
+			{
+				disconnect_and_remove_client(CLIENT_ID(client), clients,
+				                             &client_fds, 1);
+				i--;
+			}
+		}
+	}
+
+	done:
+		if(debug_level >= DEBUG_LEVEL1)
+			printf("Cleaning up...\n");
+		if(tcp_serv)
+	{
+		sock_close(tcp_serv);
+		sock_free(tcp_serv);
+	}
+		if(udp_serv)
+	{
+		sock_close(udp_serv);
+		sock_free(udp_serv);
+	}
+		if(clients)
+			list_free(clients);
+		if(conn_clients)
+			list_free(conn_clients);
+		if(debug_level >= DEBUG_LEVEL1)
+			printf("Goodbye.\n");
+		return 0;
+}
+
+/*
+ * Closes the TCP and UDP connections for the client and remove its stuff from
+ * the lists.
+ */
+void disconnect_and_remove_client(uint16_t id, list_t *clients,
+                                  fd_set *fds, int full_disconnect)
+{
+	client_t *c;
+
+	c = list_get(clients, &id);
+	if(!c)
+		return;
+
+	client_remove_tcp_fd_from_set(c, fds);
+	client_disconnect_tcp(c);
+
+	if(full_disconnect)
+	{
+		client_send_goodbye(c);
+
+		if(debug_level >= DEBUG_LEVEL1)
+			printf("Client %d disconnected.\n", CLIENT_ID(c));
+
+		client_remove_udp_fd_from_set(c, fds);
+		client_disconnect_udp(c);
+		list_delete(clients, &id);
+	}
+}
+
+/*
+ * Handles a message received from the UDP tunnel. Returns 0 if successful, -1
+ * on some error it handled, or -2 if the client is to disconnect.
+ */
+int handle_message(uint16_t id, uint8_t msg_type,
+                   char *data, int data_len,uint32_t sourceid, list_t *clients,list_t *conn_clients)
+{
+	client_t *c;
+	client_t *c2;
+
+	int ret = 0;
+	uint16_t req_id;	
+	char addrstr[ADDRSTRLEN];
+	if(debug_level >= DEBUG_LEVEL2)
+		printf("handle msg from %d type %d \n ",sourceid,msg_type);
+
+
+	switch(msg_type)
+	{
+		case MSG_TYPE_GOODBYE:
+			ret = -2;
+			break;
+
+		case MSG_TYPE_HELLOACK:
+		{
+			char * ptr_de=NULL;
+			char * keyfile=malloc(64);
+			sprintf(keyfile,"%s.key",lhost);
+
+
+			req_id = ntohs(*((uint16_t*)data));
+			//req_id = ntohs(*((uint16_t*)data));
+			data+=sizeof(req_id);	
+			data_len-=sizeof(req_id);
+			ptr_de=my_rsadecrypt(data,keyfile);
+			printf("key is %s",ptr_de);
+
+			if(debug_level >= DEBUG_LEVEL1)
+				printf("req id %d ",req_id);
+			c = list_get(conn_clients, &req_id);
+			if(debug_level >= DEBUG_LEVEL1)
+				printf("find client %d \n",CLIENT_ID(c));
+			client_got_helloack(c);
+			CLIENT_ID(c) = id;
+			memcpy(c->deskey,ptr_de,strlen(ptr_de));
+			ret = client_send_helloack(c, ntohs(*((uint16_t *)data)));
+
+			if(debug_level >= DEBUG_LEVEL1)
+			{
+				sock_get_str(c->tcp_sock, addrstr, sizeof(addrstr));
+				printf("New connection(%d): tcp://%s", CLIENT_ID(c), addrstr);
+				       sock_get_str(c->udp_sock, addrstr, sizeof(addrstr));
+				       printf(" -> udp://%s\n", addrstr);
+			              }
+			c = list_add(clients, c, 1);
+			list_delete(conn_clients, &id);
+			ret = client_socks5_helloack(c);
+
+			break;
+		}
+		case MSG_TYPE_DATA0:
+		//case MSG_TYPE_DATA1:
+			c = list_get(clients, &id);
+			ret = client_got_udp_data(c, data, data_len, msg_type);
+			if(ret == 0)
+				ret = client_send_tcp_data(c);
+			break;
+
+		//case MSG_TYPE_ACK0:
+		// case MSG_TYPE_ACK1:
+			//ret = client_got_ack(c, msg_type);
+			//    break;
+		case MSG_TYPE_RELAYKEY:
+		{			
+			client_t *c2;
+			if(id != 0)
+				break;
+			char * ptr_de;
+			char * keyfile=malloc(64);
+			sprintf(keyfile,"%s.key",lhost);
+			c2 = list_get_at(relay_clients, 0);
+			printf("c2->rsakey is %s \n",c2->rsakey);	
+			ptr_de=my_rsadecrypt(data,keyfile);
+			printf("relaykey is %s len is %d \n",ptr_de,strlen(ptr_de));			
+			memcpy(c2->rsakey,ptr_de,strlen(ptr_de));
+			printf("c2->rsakey is %s \n",c2->rsakey);			
+			break;
+
+		}
+		case MSG_TYPE_REQACK:
+		{
+			int i;
+			char port[6]; /* need this so port str can have null term. */
+
+			char dst_addrstr[ADDRSTRLEN];
+
+			uint16_t req_id;
+			socket_t *intra_sock = NULL;
+			
+			if(id != 0)
+				break;
+
+			char * ptr_de=NULL;
+			char * keyfile=malloc(64);
+			sprintf(keyfile,"%s.key",lhost);
+			ptr_de=my_rsadecrypt(data,keyfile);
+
+			req_id = ntohs(*((uint16_t*)ptr_de));
+			ptr_de += sizeof(uint16_t);			
+
+			int ptr_len=strlen(ptr_de);
+			if (ptr_len>20)
+				break;
+			//printf("ptr_len %d \n",ptr_len);
+			/* look for the space separating the host and port */
+			for(i = 0; i < ptr_len; i++)
+				if(ptr_de[i] == ' ')
+				break;
+			if(i == ptr_len)
+				break;
+
+			/* null terminate the host and get the port number to the string */
+			ptr_de[i++] = 0;
+			strncpy(port, ptr_de+i, ptr_len-i);
+			port[ptr_len-i] = 0;
+			//printf("req_id %d,host %s, port %s \n",req_id,ptr_de,port);
+			intra_sock = sock_create(ptr_de, port, ipver, SOCK_TYPE_UDP, 0, 1);
+			ERROR_GOTO(intra_sock == NULL, "Error creating udp socket", error);		
+
+			if(debug_level >= DEBUG_LEVEL1)
+			{
+				sock_get_str(intra_sock, dst_addrstr,
+				             sizeof(dst_addrstr));
+				printf("intra server:%s\n", dst_addrstr);
+			}
+			//printf("relays need %d \n",relays);
+			msg_send_reqrelay(intra_sock, lhost, rport, 0,localid,sourceid,relays);		
+			break;
+		}
+
+		case MSG_TYPE_RELAYACK:
+		{
+			int i;
+			char port[6]; /* need this so port str can have null term. */
+			uint8_t exp;
+			char dst_addrstr[ADDRSTRLEN];
+			socket_t *tcp_sock = NULL;
+			uint16_t req_id;
+
+			if(id != 0)
+				break;
+
+			char * ptr_de=NULL;
+			char * keyfile=malloc(64);
+			sprintf(keyfile,"%s.key",lhost);
+			ptr_de=my_rsadecrypt(data,keyfile);
+
+			req_id = ntohs(*((uint16_t*)ptr_de));
+			ptr_de += sizeof(uint16_t);
+			exp = *((uint8_t*)ptr_de);
+			ptr_de += sizeof(uint8_t);
+
+			int ptr_len=strlen(ptr_de);
+			if (ptr_len>20)
+				break;
+			//printf("ptr_len %d \n",ptr_len);
+			/* look for the space separating the host and port */
+			for(i = 0; i < ptr_len; i++)
+				if(ptr_de[i] == ' ')
+				break;
+			if(i == ptr_len)
+				break;
+
+			/* null terminate the host and get the port number to the string */
+			ptr_de[i++] = 0;
+			strncpy(port, ptr_de+i, ptr_len-i);
+			port[ptr_len-i] = 0;
+			//printf("req_id %d,host %s, port %s \n",req_id,ptr_de,port);
+			tcp_sock = sock_create(ptr_de, port, ipver, SOCK_TYPE_UDP, 0, 1);
+			ERROR_GOTO(tcp_sock == NULL, "Error creating udp socket", error);
+			
+			if (0<LIST_LEN(relay_clients))
+			{
+				c2 = list_get_at(relay_clients, i);	
+				c2->tcp_sock=tcp_sock;										
+			}
+			else	
+			{
+				c = client_create(1, sourceid, tcp_sock,udp_serv,0);
+				ERROR_GOTO(c == NULL, "Error creating client", error);			
+				c2 = list_add(relay_clients, c, 1);	
+				printf("added relay_cleints id %d\n",sourceid);
+				ERROR_GOTO(c2 == NULL, "Error adding client to list", error);
+			}	
+			if(debug_level >= DEBUG_LEVEL1)
+			{
+
+				sock_get_str(CLIENT_TCP_SOCK(c2), dst_addrstr,
+				             sizeof(dst_addrstr));
+				printf("tunnel %d nexthop:%s\n",
+				       sourceid,  dst_addrstr);
+			}
+
+
+			break;			 
+		}
+
+		default:
+			ret = -1;
+			break;
+	}
+
+
+	return ret;
+	error:
+		return -1;
+}
+
+void signal_handler(int sig)
+{
+	switch(sig)
+	{
+		case SIGINT:
+			running = 0;
+	}
+}

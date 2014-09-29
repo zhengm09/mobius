@@ -1,0 +1,15 @@
+Starting client 1
+~/mobius/Debug/src/tools/run-client.pl 10.0.0.11 2001 3001 1 &
+LD_PRELOAD=/usr/local/lib/libipaddr.so SRCIP=10.0.0.11 ~/mobius/Debug/src/mobius -c 10.0.0.11 2001 3001 10.0.0.1 5350 1 -v > /tmp/mobius-client-10.0.0.11:2001/log
+Starting client 2
+~/mobius/Debug/src/tools/run-client.pl 10.0.0.2 2002 3002 0 &
+LD_PRELOAD=/usr/local/lib/libipaddr.so SRCIP=10.0.0.2 ~/mobius/Debug/src/mobius -c 10.0.0.2 2002 3002 10.0.0.1 5350 3 -v > /tmp/mobius-client-10.0.0.2:2002/log
+Starting client 3
+~/mobius/Debug/src/tools/run-client.pl 10.0.0.43 2003 3003 0 &
+LD_PRELOAD=/usr/local/lib/libipaddr.so SRCIP=10.0.0.43 ~/mobius/Debug/src/mobius -c 10.0.0.43 2003 3003 10.0.0.1 5350 3 -v > /tmp/mobius-client-10.0.0.43:2003/log
+Starting client 4
+~/mobius/Debug/src/tools/run-client.pl 10.0.0.15 2004 3004 0 &
+LD_PRELOAD=/usr/local/lib/libipaddr.so SRCIP=10.0.0.15 ~/mobius/Debug/src/mobius -c 10.0.0.15 2004 3004 10.0.0.1 5350 3 -v > /tmp/mobius-client-10.0.0.15:2004/log
+Starting client 5
+~/mobius/Debug/src/tools/run-client.pl 10.0.0.44 2005 3005 0 &
+LD_PRELOAD=/usr/local/lib/libipaddr.so SRCIP=10.0.0.44 ~/mobius/Debug/src/mobius -c 10.0.0.44 2005 3005 10.0.0.1 5350 3 -v > /tmp/mobius-client-10.0.0.44:2005/log
